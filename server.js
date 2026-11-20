@@ -27,14 +27,27 @@ if (TOKEN) {
 const srv = http.createServer((req, res) => {
   if (hook && req.method === 'POST' && req.url === hookPath) return hook(req, res);
   if (req.url === '/health') { res.end('ok'); return; }
+  const f = [path.join(dir, 'index.html'), path.join(dir, 'public', 'index.html')].find((p) => fs.existsSync(p));
+  if (!f) { res.writeHead(500); res.end('index.html not found'); return; }
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
-  res.end(fs.readFileSync(path.join(dir, 'public', 'index.html')));
+  res.end(fs.readFileSync(f));
 });
 
 // ---------- WebSocket: игроки ----------
 const wss = new WebSocketServer({ server: srv, path: '/ws', maxPayload: 1024 });
 const players = new Map();
 let nextId = 1;
+const EMOTE_MS = Number(process.env.EMOTE_MS) || 5000; // эмоция висит 5 секунд
+const chat = [];
+const HALF = Number(process.env.CHAT_RESET_MS) || 30 * 60 * 1000; // чат очищается каждые 30 минут
+let nextReset = Math.ceil(Date.now() / HALF) * HALF;
+setInterval(() => {
+  if (Date.now() < nextReset) return;
+  chat.length = 0; nextReset += HALF;
+  const out = JSON.stringify({ t: 'cr', reset: nextReset });
+  wss.clients.forEach((c) => c.readyState === 1 && c.send(out));
+}, 1000);
+
 const num = (v, a, b) => Math.min(b, Math.max(a, Number.isFinite(+v) ? +v : 0));
 const clean = (n) => String(n || 'Игрок').replace(/[<>&"'`]/g, '').slice(0, 18) || 'Игрок';
 
@@ -57,14 +70,24 @@ wss.on('connection', (ws) => {
   players.set(id, me);
   ws.alive = true;
   ws.on('pong', () => (ws.alive = true));
-  ws.send(JSON.stringify({ t: 'hi', id }));
+  ws.send(JSON.stringify({ t: 'hi', id, chat: chat.slice(-50), reset: nextReset, now: Date.now() }));
   ws.on('message', (raw) => {
     let m; try { m = JSON.parse(raw); } catch { return; }
     if (m.t === 'j') { me.n = verify(m.init) || clean(m.n); }
+    else if (m.t === 'e') {
+      const k = m.e | 0, now = Date.now(); if (k < 1 || k > 5 || now - (me.lastEmote || 0) < 1000) return;
+      me.lastEmote = now; me.em = k; me.emT = now + EMOTE_MS;
+    }
+    else if (m.t === 'c') {
+      const now = Date.now(); if (now - (me.lastChat || 0) < 1000) return; me.lastChat = now;
+      const text = String(m.m || '').replace(/[<>]/g, '').trim().slice(0, 120); if (!text) return;
+      const msg = { n: me.n, m: text, ts: now }; chat.push(msg); if (chat.length > 100) chat.shift();
+      const out = JSON.stringify({ t: 'c', ...msg }); wss.clients.forEach((c) => c.readyState === 1 && c.send(out));
+    }
     else if (m.t === 's') {
       const now = Date.now(); if (now - me.t < 40) return; me.t = now;
-      me.x = num(m.x, -400, 400); me.z = num(m.z, -400, 400); me.psi = num(m.psi, -1e4, 1e4);
-      me.v = num(m.v, -60, 60); me.st = num(m.st, -1, 1); me.vi = num(m.vi, 0, 4) | 0;
+      me.x = num(m.x, -1200, 1200); me.z = num(m.z, -1200, 1200); me.psi = num(m.psi, -1e4, 1e4);
+      me.v = num(m.v, -60, 60); me.st = num(m.st, -1, 1); me.vi = num(m.vi, 0, 5) | 0;
       me.l = m.l ? 1 : 0; me.d = m.d ? 1 : 0;
     }
   });
@@ -73,7 +96,7 @@ wss.on('connection', (ws) => {
 
 setInterval(() => { // рассылка состояния 15 раз в секунду
   if (!wss.clients.size) return;
-  const msg = JSON.stringify({ t: 'w', p: [...players.values()].map(({ t, ...p }) => p) });
+  const msg = JSON.stringify({ t: 'w', p: [...players.values()].map(({ t, lastChat, lastEmote, emT, em, ...p }) => ({ ...p, e: emT > Date.now() ? em : 0 })) });
   wss.clients.forEach((c) => c.readyState === 1 && c.send(msg));
 }, 66);
 setInterval(() => wss.clients.forEach((c) => { if (!c.alive) return c.terminate(); c.alive = false; c.ping(); }), 30000);
